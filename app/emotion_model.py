@@ -54,12 +54,13 @@ MODELS_REGISTRY: list[ModelConfig] = [
             "LABEL_5": "neutral",
         },
     ),
-    # ── Model 2: wav2vec2 fine-tuned on IEMOCAP via SUPERB benchmark ──────────
-    # 4-class: neutral / happy / angry / sad
-    # Model card: https://huggingface.co/superb/wav2vec2-base-superb-er
+    # ── Model 2: wav2vec2-LARGE fine-tuned on IEMOCAP via SUPERB benchmark ──────
+    # Same 4-class taxonomy as the base SUPERB model but backed by the large
+    # wav2vec2 encoder (317M params vs 95M).
+    # Model card: https://huggingface.co/superb/wav2vec2-large-superb-er
     ModelConfig(
-        model_id="superb/wav2vec2-base-superb-er",
-        short_name="superb",
+        model_id="superb/wav2vec2-large-superb-er",
+        short_name="superb_large",
         label_map={
             "LABEL_0": "neutral",
             "LABEL_1": "happy",
@@ -67,25 +68,26 @@ MODELS_REGISTRY: list[ModelConfig] = [
             "LABEL_3": "sad",
         },
     ),
-    # ── Model 3: XLS-R large fine-tuned on RAVDESS + TESS + CREMA-D + SAVEE ──
-    # 8-class: angry, calm, disgust, fearful, happy, neutral, sad, surprised
-    # Model card: https://huggingface.co/ehcalabres/wav2vec2-lg-xlsr-en-speech-emotion-recognition
+    # ── Model 3: XLSR-53-large fine-tuned on RAVDESS + SAVEE + TESS ──────────
+    # 7-class: angry, disgust, fear, happy, neutral, sad, surprise
+    # Based on facebook/wav2vec2-large-xlsr-53 (300M params cross-lingual).
+    # Model card: https://huggingface.co/harshit345/xlsr-wav2vec-speech-emotion-recognition
     ModelConfig(
-        model_id="ehcalabres/wav2vec2-lg-xlsr-en-speech-emotion-recognition",
-        short_name="ehcalabres",
+        model_id="harshit345/xlsr-wav2vec-speech-emotion-recognition",
+        short_name="xlsr_large",
         label_map={
-            "LABEL_0": "neutral",
-            "LABEL_1": "calm",     # → neutral via _COMMON_ALIASES
-            "LABEL_2": "happy",
-            "LABEL_3": "sad",
-            "LABEL_4": "angry",
-            "LABEL_5": "fear",
-            "LABEL_6": "disgust",
-            "LABEL_7": "surprise",
-            # also handle if model returns string labels directly
-            "angry": "angry", "calm": "neutral", "disgust": "disgust",
-            "fearful": "fear", "happy": "happy", "neutral": "neutral",
-            "sad": "sad", "surprised": "surprise",
+            # Model returns LABEL_X in RAVDESS alphabetical order.
+            "LABEL_0": "angry",
+            "LABEL_1": "disgust",
+            "LABEL_2": "fear",
+            "LABEL_3": "happy",
+            "LABEL_4": "neutral",
+            "LABEL_5": "sad",
+            "LABEL_6": "surprise",
+            # Passthrough for models that return string labels directly.
+            "angry": "angry", "disgust": "disgust", "fear": "fear",
+            "happy": "happy", "neutral": "neutral", "sad": "sad",
+            "surprise": "surprise", "surprised": "surprise",
         },
     ),
 ]
