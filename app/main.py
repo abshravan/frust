@@ -88,7 +88,7 @@ async def analyze(
         tmp_path = Path(tmp.name)
 
     try:
-        report_dict = _run_pipeline(tmp_path, file.filename or "unknown")
+        report_dict = analyze_file(tmp_path, file.filename or "unknown")
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
     except Exception as exc:
@@ -102,7 +102,13 @@ async def analyze(
 
 # ── Pipeline ──────────────────────────────────────────────────────────────────
 
-def _run_pipeline(audio_path: Path, filename: str) -> dict:
+def analyze_file(audio_path: Path, filename: str | None = None) -> dict:
+    """Run the full audio → emotion → report pipeline on a single file.
+
+    Returns the report dict (same shape as the /analyze HTTP response).
+    Importable from batch.py and other entry points.
+    """
+    filename = filename or Path(audio_path).name
     logger.info("── BEGIN analysis: %s ──", filename)
 
     # 1. Load & normalize
