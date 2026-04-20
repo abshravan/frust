@@ -1,4 +1,4 @@
-"""Emotion classification from audio segments using HuggingFace wav2vec2."""
+"""Emotion classification from audio segments using HuggingFace audio-classification pipeline."""
 
 import logging
 from dataclasses import dataclass, field
@@ -7,41 +7,28 @@ from typing import Optional
 
 import numpy as np
 import torch
-from transformers import AutoFeatureExtractor, AutoModelForAudioClassification
+from transformers import pipeline
 
 from segmenter import AudioSegment
 
 logger = logging.getLogger(__name__)
 
-# Primary model: wav2vec2-based emotion classifier trained on speech emotion data.
-# Fallback lets operators swap the model via env var or config.
-DEFAULT_MODEL_ID = "ehcalabres/wav2vec2-lg-xlsr-en-speech-emotion-recognition"
+# This is the model that works well in practice for hospital-call frustration
+# detection. It returns 6 raw LABEL_X ids which we map to canonical emotions.
+DEFAULT_MODEL_ID = "Khoa/w2v-speech-emotion-recognition"
 
-# Canonical emotion labels the rest of the pipeline expects.
-# Models may use different label names; LABEL_ALIASES maps them to canonical ones.
-CANONICAL_EMOTIONS = {"angry", "frustrated", "neutral", "sad", "disgust", "happy", "fear", "surprise"}
-
-LABEL_ALIASES: dict[str, str] = {
-    # common wav2vec2 label variants → canonical
-    "ang": "angry",
-    "anger": "angry",
-    "fru": "frustrated",
-    "frustration": "frustrated",
-    "neu": "neutral",
-    "neutral_state": "neutral",
-    "sad": "sad",
-    "sadness": "sad",
-    "dis": "disgust",
-    "disgust": "disgust",
-    "hap": "happy",
-    "happiness": "happy",
-    "fea": "fear",
-    "sur": "surprise",
-    "calm": "neutral",
-    "boredom": "neutral",
-    "excited": "happy",
-    "ps": "surprise",
+# Raw label → canonical emotion (taken from the validated reference pipeline).
+LABEL_MAP: dict[str, str] = {
+    "LABEL_0": "sad",
+    "LABEL_1": "angry",
+    "LABEL_2": "disgust",
+    "LABEL_3": "fear",
+    "LABEL_4": "happy",
+    "LABEL_5": "neutral",
 }
+
+# Emotions the downstream report consumers expect to see.
+CANONICAL_EMOTIONS = ("angry", "frustrated", "neutral", "sad", "disgust", "happy", "fear")
 
 
 @dataclass
@@ -56,47 +43,48 @@ class SegmentPrediction:
 
 class EmotionClassifier:
     """
-    Wraps a HuggingFace audio classification model.
+    Thin wrapper around HuggingFace's `pipeline("audio-classification")`.
 
-    The instance is designed to be created once and reused across requests
-    (singleton pattern via get_classifier()).
+    Created once and reused across requests (singleton via `get_classifier()`).
     """
 
-    def __init__(self, model_id: str = DEFAULT_MODEL_ID, device: Optional[str] = None):
+    def __init__(self, model_id: str = DEFAULT_MODEL_ID, device: Optional[int] = None):
         self.model_id = model_id
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        logger.info("Loading emotion model '%s' on %s", model_id, self.device)
+        if device is None:
+            device = 0 if torch.cuda.is_available() else -1
+        self.device = device
 
-        self.feature_extractor = AutoFeatureExtractor.from_pretrained(model_id)
-        self.model = AutoModelForAudioClassification.from_pretrained(model_id)
-        self.model.to(self.device)
-        self.model.eval()
+        logger.info(
+            "Loading emotion pipeline '%s' on %s",
+            model_id,
+            "cuda:0" if device == 0 else "cpu",
+        )
 
-        self._id2label: dict[int, str] = {
-            int(k): v for k, v in self.model.config.id2label.items()
-        }
-        logger.info("Model loaded. Labels: %s", list(self._id2label.values()))
+        self.pipe = pipeline(
+            "audio-classification",
+            model=model_id,
+            device=device,
+            top_k=None,  # return scores for all labels
+        )
+        logger.info("Emotion pipeline ready.")
 
     def predict_segment(self, segment: AudioSegment) -> SegmentPrediction:
-        """Run inference on a single AudioSegment and return normalized scores."""
-        inputs = self.feature_extractor(
-            segment.audio,
-            sampling_rate=segment.sample_rate,
-            return_tensors="pt",
-            padding=True,
-        )
-        inputs = {k: v.to(self.device) for k, v in inputs.items()}
-
-        with torch.no_grad():
-            logits = self.model(**inputs).logits
-
-        probs = torch.softmax(logits, dim=-1).squeeze().cpu().numpy()
-
-        raw_scores: dict[str, float] = {
-            self._id2label[i]: float(probs[i]) for i in range(len(probs))
+        """Run inference on a single AudioSegment and return canonical scores."""
+        audio_input = {
+            "array": segment.audio.astype(np.float32),
+            "sampling_rate": segment.sample_rate,
         }
+        preds = self.pipe(audio_input)
 
-        canonical_scores = _canonicalize_scores(raw_scores)
+        # preds: list of {"label": "LABEL_X", "score": float}
+        canonical_scores: dict[str, float] = {}
+        for p in preds:
+            emotion = LABEL_MAP.get(p["label"], p["label"].lower())
+            canonical_scores[emotion] = canonical_scores.get(emotion, 0.0) + float(p["score"])
+
+        # Ensure every canonical key is present (default 0.0)
+        for emotion in CANONICAL_EMOTIONS:
+            canonical_scores.setdefault(emotion, 0.0)
 
         dominant = max(canonical_scores, key=canonical_scores.get)
         confidence = canonical_scores[dominant]
@@ -111,12 +99,11 @@ class EmotionClassifier:
         )
 
     def predict_all(self, segments: list[AudioSegment]) -> list[SegmentPrediction]:
-        """Run inference over all segments sequentially."""
         predictions: list[SegmentPrediction] = []
         for seg in segments:
             pred = self.predict_segment(seg)
             logger.debug(
-                "Segment %d [%.1f-%.1f s]: %s (%.2f)",
+                "Segment %d [%.2f-%.2f s]: %s (%.3f)",
                 seg.index,
                 seg.start_s,
                 seg.end_s,
@@ -125,24 +112,6 @@ class EmotionClassifier:
             )
             predictions.append(pred)
         return predictions
-
-
-def _canonicalize_scores(raw_scores: dict[str, float]) -> dict[str, float]:
-    """
-    Map model-specific label names to canonical emotion labels.
-    Scores for the same canonical label are summed.
-    """
-    canonical: dict[str, float] = {}
-    for label, score in raw_scores.items():
-        normalized = label.lower().strip()
-        canonical_label = LABEL_ALIASES.get(normalized, normalized)
-        canonical[canonical_label] = canonical.get(canonical_label, 0.0) + score
-
-    # Ensure all key canonical emotions are present (default 0.0)
-    for emotion in ("angry", "neutral", "sad", "disgust", "frustrated"):
-        canonical.setdefault(emotion, 0.0)
-
-    return canonical
 
 
 @lru_cache(maxsize=1)

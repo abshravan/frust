@@ -9,9 +9,15 @@ from emotion_model import SegmentPrediction
 
 logger = logging.getLogger(__name__)
 
-# ── Thresholds ────────────────────────────────────────────────────────────────
-ANGRY_THRESHOLD = 0.65
+# ── Thresholds (aligned with validated reference pipeline) ───────────────────
+ANGRY_THRESHOLD = 0.60
 DISGUST_THRESHOLD = 0.60
+
+# Window counts as "frustrated" when anger sits in the mid band below the
+# angry threshold. Lets us derive a frustrated label from a 6-class model
+# that does not emit "frustrated" directly.
+FRUSTRATED_LOWER = 0.35
+FRUSTRATED_UPPER = ANGRY_THRESHOLD  # exclusive upper bound
 
 # ── Flagging criteria ─────────────────────────────────────────────────────────
 CONSECUTIVE_ANGRY_LIMIT = 2
@@ -75,11 +81,11 @@ class AnalysisReport:
 def build_report(predictions: list[SegmentPrediction]) -> AnalysisReport:
     """
     Full post-processing pipeline:
-      1. Smooth probability scores
-      2. Re-classify dominant emotion per window
+      1. Smooth probability scores (moving average, window=3)
+      2. Re-classify dominant emotion per window (with frustrated derivation)
       3. Compute metrics
       4. Apply flagging rules
-      5. Detect escalation
+      5. Detect escalation chain
       6. Build timeline
     """
     if not predictions:
@@ -146,19 +152,14 @@ def build_report(predictions: list[SegmentPrediction]) -> AnalysisReport:
 def _smooth_predictions(
     predictions: list[SegmentPrediction],
 ) -> list[dict[str, float]]:
-    """
-    Moving-average smoothing over per-emotion probability scores.
-    Returns a list of smoothed score dicts aligned with predictions.
-    """
+    """Moving-average smoothing over per-emotion probability scores."""
     n = len(predictions)
     half = SMOOTHING_WINDOW // 2
 
-    # Collect all emotion keys across all predictions
     emotion_keys: set[str] = set()
     for p in predictions:
         emotion_keys.update(p.scores.keys())
 
-    # Build (n x emotions) matrix
     score_matrix = {
         key: np.array([p.scores.get(key, 0.0) for p in predictions], dtype=float)
         for key in emotion_keys
@@ -178,32 +179,35 @@ def _classify(
     smoothed: list[dict[str, float]],
 ) -> list[tuple[str, float]]:
     """
-    Determine dominant emotion and confidence from smoothed scores.
-    Applies per-emotion thresholds to override if below threshold.
+    Determine per-window label:
+      - anger ≥ ANGRY_THRESHOLD     → "angry"
+      - FRUSTRATED_LOWER ≤ anger < ANGRY_THRESHOLD → "frustrated"
+      - disgust ≥ DISGUST_THRESHOLD → "disgust"
+      - else → dominant non-angry emotion from the model
     """
     results: list[tuple[str, float]] = []
     for scores in smoothed:
-        dominant = max(scores, key=scores.get)
-        conf = scores[dominant]
+        anger = scores.get("angry", 0.0)
+        disgust = scores.get("disgust", 0.0)
 
-        # Threshold gating: if the dominant emotion's score is below its
-        # threshold, fall back to neutral.
-        if dominant == "angry" and conf < ANGRY_THRESHOLD:
-            dominant = _next_best(scores, exclude="angry")
-        elif dominant == "disgust" and conf < DISGUST_THRESHOLD:
-            dominant = _next_best(scores, exclude="disgust")
+        if anger >= ANGRY_THRESHOLD:
+            results.append(("angry", round(anger, 4)))
+            continue
+        if disgust >= DISGUST_THRESHOLD:
+            results.append(("disgust", round(disgust, 4)))
+            continue
+        if FRUSTRATED_LOWER <= anger < FRUSTRATED_UPPER:
+            results.append(("frustrated", round(anger, 4)))
+            continue
 
-        conf = scores[dominant]
-        results.append((dominant, round(conf, 4)))
+        non_angry = {k: v for k, v in scores.items() if k not in ("angry", "disgust")}
+        if not non_angry:
+            results.append(("neutral", 0.0))
+            continue
+        dominant = max(non_angry, key=non_angry.get)
+        results.append((dominant, round(non_angry[dominant], 4)))
 
     return results
-
-
-def _next_best(scores: dict[str, float], exclude: str) -> str:
-    filtered = {k: v for k, v in scores.items() if k != exclude}
-    if not filtered:
-        return "neutral"
-    return max(filtered, key=filtered.get)
 
 
 def _anger_ratio(classified: list[tuple[str, float]]) -> float:

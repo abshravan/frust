@@ -7,8 +7,8 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-WINDOW_SIZE_S = 5.0
-OVERLAP_S = 2.0
+WINDOW_SIZE_S = 3.0
+OVERLAP_S = 1.5  # 50% overlap — matches the validated reference pipeline
 
 
 @dataclass(frozen=True)

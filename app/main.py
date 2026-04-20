@@ -5,7 +5,7 @@ Start with:
     uvicorn main:app --host 0.0.0.0 --port 8000
 
 Environment variables:
-    EMOTION_MODEL_ID  – HuggingFace model ID (default: ehcalabres/wav2vec2-...)
+    EMOTION_MODEL_ID  – HuggingFace model ID (default: Khoa/w2v-speech-emotion-recognition)
     LOG_LEVEL         – Python log level string (default: INFO)
     ENABLE_WHISPER    – "1" to enable Whisper transcription bonus feature
 """
