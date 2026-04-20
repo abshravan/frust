@@ -1,8 +1,9 @@
 """Emotion classification from audio segments using HuggingFace audio-classification pipeline."""
 
+from __future__ import annotations
+
 import logging
 from dataclasses import dataclass, field
-from functools import lru_cache
 from typing import Optional
 
 import numpy as np
@@ -13,23 +14,88 @@ from segmenter import AudioSegment
 
 logger = logging.getLogger(__name__)
 
-# This is the model that works well in practice for hospital-call frustration
-# detection. It returns 6 raw LABEL_X ids which we map to canonical emotions.
-DEFAULT_MODEL_ID = "Khoa/w2v-speech-emotion-recognition"
 
-# Raw label → canonical emotion (taken from the validated reference pipeline).
-LABEL_MAP: dict[str, str] = {
-    "LABEL_0": "sad",
-    "LABEL_1": "angry",
-    "LABEL_2": "disgust",
-    "LABEL_3": "fear",
-    "LABEL_4": "happy",
-    "LABEL_5": "neutral",
+# ── Model registry ────────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class ModelConfig:
+    """Describes one audio-emotion model and its raw-label → canonical mapping."""
+    model_id: str
+    short_name: str
+    # Maps whatever the model returns (e.g. "LABEL_1", "ang") → canonical emotion.
+    # Unrecognised labels are lower-cased and passed through unchanged.
+    label_map: dict[str, str]
+
+
+# Common aliases applied after per-model mapping as a fallback.
+_COMMON_ALIASES: dict[str, str] = {
+    "ang": "angry", "anger": "angry",
+    "hap": "happy", "happiness": "happy", "excited": "happy",
+    "neu": "neutral", "calm": "neutral", "boredom": "neutral",
+    "sad": "sad", "sadness": "sad",
+    "dis": "disgust",
+    "fea": "fear", "fearful": "fear",
+    "sur": "surprise", "surprised": "surprise",
+    "fru": "frustrated", "frustrated": "frustrated",
 }
 
-# Emotions the downstream report consumers expect to see.
+# The three independent models registered for batch analysis.
+MODELS_REGISTRY: list[ModelConfig] = [
+    # ── Model 1 (primary, validated reference) ────────────────────────────────
+    ModelConfig(
+        model_id="Khoa/w2v-speech-emotion-recognition",
+        short_name="khoa",
+        label_map={
+            "LABEL_0": "sad",
+            "LABEL_1": "angry",
+            "LABEL_2": "disgust",
+            "LABEL_3": "fear",
+            "LABEL_4": "happy",
+            "LABEL_5": "neutral",
+        },
+    ),
+    # ── Model 2: wav2vec2 fine-tuned on IEMOCAP via SUPERB benchmark ──────────
+    # 4-class: neutral / happy / angry / sad
+    # Model card: https://huggingface.co/superb/wav2vec2-base-superb-er
+    ModelConfig(
+        model_id="superb/wav2vec2-base-superb-er",
+        short_name="superb",
+        label_map={
+            "LABEL_0": "neutral",
+            "LABEL_1": "happy",
+            "LABEL_2": "angry",
+            "LABEL_3": "sad",
+        },
+    ),
+    # ── Model 3: XLS-R large fine-tuned on RAVDESS + TESS + CREMA-D + SAVEE ──
+    # 8-class: angry, calm, disgust, fearful, happy, neutral, sad, surprised
+    # Model card: https://huggingface.co/ehcalabres/wav2vec2-lg-xlsr-en-speech-emotion-recognition
+    ModelConfig(
+        model_id="ehcalabres/wav2vec2-lg-xlsr-en-speech-emotion-recognition",
+        short_name="ehcalabres",
+        label_map={
+            "LABEL_0": "neutral",
+            "LABEL_1": "calm",     # → neutral via _COMMON_ALIASES
+            "LABEL_2": "happy",
+            "LABEL_3": "sad",
+            "LABEL_4": "angry",
+            "LABEL_5": "fear",
+            "LABEL_6": "disgust",
+            "LABEL_7": "surprise",
+            # also handle if model returns string labels directly
+            "angry": "angry", "calm": "neutral", "disgust": "disgust",
+            "fearful": "fear", "happy": "happy", "neutral": "neutral",
+            "sad": "sad", "surprised": "surprise",
+        },
+    ),
+]
+
+DEFAULT_MODEL_ID = MODELS_REGISTRY[0].model_id
+
 CANONICAL_EMOTIONS = ("angry", "frustrated", "neutral", "sad", "disgust", "happy", "fear")
 
+
+# ── Data classes ──────────────────────────────────────────────────────────────
 
 @dataclass
 class SegmentPrediction:
@@ -41,48 +107,51 @@ class SegmentPrediction:
     scores: dict[str, float] = field(default_factory=dict)
 
 
+# ── Classifier ────────────────────────────────────────────────────────────────
+
 class EmotionClassifier:
     """
-    Thin wrapper around HuggingFace's `pipeline("audio-classification")`.
-
-    Created once and reused across requests (singleton via `get_classifier()`).
+    Thin wrapper around HuggingFace `pipeline("audio-classification")`.
+    One instance per model; use `get_classifier()` for the singleton cache.
     """
 
-    def __init__(self, model_id: str = DEFAULT_MODEL_ID, device: Optional[int] = None):
-        self.model_id = model_id
+    def __init__(self, config: ModelConfig, device: Optional[int] = None):
+        self.config = config
         if device is None:
             device = 0 if torch.cuda.is_available() else -1
         self.device = device
 
         logger.info(
-            "Loading emotion pipeline '%s' on %s",
-            model_id,
+            "Loading emotion pipeline [%s] '%s' on %s",
+            config.short_name,
+            config.model_id,
             "cuda:0" if device == 0 else "cpu",
         )
-
-        self.pipe = pipeline(
+        self._pipe = pipeline(
             "audio-classification",
-            model=model_id,
+            model=config.model_id,
             device=device,
-            top_k=None,  # return scores for all labels
+            top_k=None,
         )
-        logger.info("Emotion pipeline ready.")
+        logger.info("[%s] ready.", config.short_name)
 
     def predict_segment(self, segment: AudioSegment) -> SegmentPrediction:
-        """Run inference on a single AudioSegment and return canonical scores."""
         audio_input = {
             "array": segment.audio.astype(np.float32),
             "sampling_rate": segment.sample_rate,
         }
-        preds = self.pipe(audio_input)
+        preds = self._pipe(audio_input)
 
-        # preds: list of {"label": "LABEL_X", "score": float}
         canonical_scores: dict[str, float] = {}
         for p in preds:
-            emotion = LABEL_MAP.get(p["label"], p["label"].lower())
-            canonical_scores[emotion] = canonical_scores.get(emotion, 0.0) + float(p["score"])
+            raw = p["label"]
+            # 1. per-model label map
+            canon = self.config.label_map.get(raw)
+            # 2. common aliases
+            if canon is None:
+                canon = _COMMON_ALIASES.get(raw.lower(), raw.lower())
+            canonical_scores[canon] = canonical_scores.get(canon, 0.0) + float(p["score"])
 
-        # Ensure every canonical key is present (default 0.0)
         for emotion in CANONICAL_EMOTIONS:
             canonical_scores.setdefault(emotion, 0.0)
 
@@ -103,7 +172,8 @@ class EmotionClassifier:
         for seg in segments:
             pred = self.predict_segment(seg)
             logger.debug(
-                "Segment %d [%.2f-%.2f s]: %s (%.3f)",
+                "[%s] seg %d [%.2f-%.2f s]: %s (%.3f)",
+                self.config.short_name,
                 seg.index,
                 seg.start_s,
                 seg.end_s,
@@ -114,7 +184,27 @@ class EmotionClassifier:
         return predictions
 
 
-@lru_cache(maxsize=1)
+# ── Singleton cache (one instance per model_id) ───────────────────────────────
+
+_classifier_cache: dict[str, EmotionClassifier] = {}
+
+
 def get_classifier(model_id: str = DEFAULT_MODEL_ID) -> EmotionClassifier:
-    """Return a cached singleton classifier instance."""
-    return EmotionClassifier(model_id=model_id)
+    """Return a cached EmotionClassifier for the given model_id."""
+    if model_id not in _classifier_cache:
+        config = next(
+            (m for m in MODELS_REGISTRY if m.model_id == model_id),
+            ModelConfig(
+                model_id=model_id,
+                short_name=model_id.split("/")[-1],
+                label_map={},
+            ),
+        )
+        _classifier_cache[model_id] = EmotionClassifier(config)
+    return _classifier_cache[model_id]
+
+
+def preload_all_models() -> None:
+    """Pre-load every registered model into the cache (call at startup)."""
+    for cfg in MODELS_REGISTRY:
+        get_classifier(cfg.model_id)
