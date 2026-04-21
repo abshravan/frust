@@ -35,49 +35,29 @@ logger = logging.getLogger(__name__)
 AUDIO_EXTENSIONS = {".wav", ".mp3", ".flac", ".ogg", ".m4a"}
 
 # ── Column layout ─────────────────────────────────────────────────────────────
-# Filled once per file (independent of models).
-_BASE_COLUMNS = [
+EXCEL_COLUMNS = [
     "filename",
     "call_id",
-    "duration_s",
-    "total_windows",
-    "processing_time_s",
-    "status",
-]
-
-# Filled per model (prefixed with model short_name).
-_PER_MODEL_SUFFIX = [
     "is_frustrating",
     "severity",
-    "frustration_score",       # anger_ratio
+    "frustration_score",
     "max_anger_score",
-    "num_frustrating_windows", # angry + frustrated windows
-    "num_frustration_segments",# consecutive angry runs
+    "num_frustrating_windows",
+    "num_frustration_segments",
     "pct_frustrated_windows",
     "longest_angry_streak",
     "escalation_detected",
+    "total_windows",
+    "duration_s",
+    "processing_time_s",
     "reason",
+    "status",
 ]
-
-# Ensemble columns (added at the end).
-_ENSEMBLE_COLUMNS = [
-    "ensemble_is_frustrating",  # majority vote across models
-    "ensemble_num_models_flagged",
-]
-
-
-def _all_columns() -> list[str]:
-    cols = list(_BASE_COLUMNS)
-    for cfg in MODELS_REGISTRY:
-        for suffix in _PER_MODEL_SUFFIX:
-            cols.append(f"{cfg.short_name}_{suffix}")
-    cols.extend(_ENSEMBLE_COLUMNS)
-    return cols
 
 
 # ── Per-model metrics from a report dict ─────────────────────────────────────
 
-def _extract_metrics(report: dict, short_name: str) -> dict:
+def _extract_metrics(report: dict) -> dict:
     """Pull the scalar metrics we want into a flat dict with prefixed keys."""
     timeline = report.get("timeline", [])
     num_windows = len(timeline)
@@ -88,21 +68,20 @@ def _extract_metrics(report: dict, short_name: str) -> dict:
     longest = _longest_angry_streak(timeline)
     num_segs = _count_angry_segments(timeline)
 
-    p = short_name
     return {
-        f"{p}_is_frustrating":        bool(report.get("flagged", False)),
-        f"{p}_severity":               report.get("severity", ""),
-        f"{p}_frustration_score":      report.get("anger_ratio", 0.0),
-        f"{p}_max_anger_score":        report.get("max_anger_score", 0.0),
-        f"{p}_num_frustrating_windows": num_frustrating,
-        f"{p}_num_frustration_segments": num_segs,
-        f"{p}_pct_frustrated_windows":  round(num_frustrating / num_windows, 4)
-                                        if num_windows else 0.0,
-        f"{p}_longest_angry_streak":   longest,
-        f"{p}_escalation_detected":    bool(report.get("escalation_detected", False)),
-        f"{p}_reason":                 report.get("reason", ""),
-        "_duration_s":                 round(duration_s, 2),
-        "_total_windows":              num_windows,
+        "is_frustrating":        bool(report.get("flagged", False)),
+        "severity":               report.get("severity", ""),
+        "frustration_score":      report.get("anger_ratio", 0.0),
+        "max_anger_score":        report.get("max_anger_score", 0.0),
+        "num_frustrating_windows": num_frustrating,
+        "num_frustration_segments": num_segs,
+        "pct_frustrated_windows":  round(num_frustrating / num_windows, 4)
+                                   if num_windows else 0.0,
+        "longest_angry_streak":   longest,
+        "escalation_detected":    bool(report.get("escalation_detected", False)),
+        "reason":                 report.get("reason", ""),
+        "_duration_s":            round(duration_s, 2),
+        "_total_windows":         num_windows,
     }
 
 
@@ -129,75 +108,53 @@ def _count_angry_segments(timeline: list[dict]) -> int:
     return count
 
 
-# ── Core: run all models on one file ─────────────────────────────────────────
+# ── Core: run the model on one file ──────────────────────────────────────────
 
-def _run_all_models(audio_path: Path) -> tuple[dict, list[dict]]:
-    """
-    Load audio once, segment once, then classify with every registered model.
-
-    Returns:
-        row       – flat dict of all Excel columns for this file
-        full_data – list of per-model report dicts (for JSON dump)
-    """
+def _run_pipeline(audio_path: Path) -> tuple[dict, dict]:
+    """Load, segment, classify, and build the report for a single file."""
     filename = audio_path.name
     call_id = audio_path.stem
     t0 = time.time()
 
-    # Shared audio loading + segmentation.
     audio, sr = load_audio(audio_path)
     segments = segment_audio(audio, sr)
 
-    row: dict = {"filename": filename, "call_id": call_id}
-    full_data: list[dict] = []
-    duration_s: float = 0.0
-    total_windows: int = len(segments)
+    cfg = MODELS_REGISTRY[0]
+    classifier = get_classifier(cfg.model_id)
+    predictions = classifier.predict_all(segments)
+    report = build_report(predictions)
+    report_dict = report.to_dict()
 
-    for cfg in MODELS_REGISTRY:
-        classifier = get_classifier(cfg.model_id)
-        predictions = classifier.predict_all(segments)
-        report = build_report(predictions)
-        report_dict = report.to_dict()
+    metrics = _extract_metrics(report_dict)
+    duration_s = metrics.pop("_duration_s", 0.0)
+    total_windows = metrics.pop("_total_windows", len(segments))
 
-        metrics = _extract_metrics(report_dict, cfg.short_name)
-        duration_s = max(duration_s, metrics.pop("_duration_s", 0.0))
-        total_windows = metrics.pop("_total_windows", total_windows)
-        row.update(metrics)
+    row = {
+        "filename": filename,
+        "call_id": call_id,
+        **metrics,
+        "total_windows": total_windows,
+        "duration_s": duration_s,
+        "processing_time_s": round(time.time() - t0, 2),
+        "status": "Success",
+    }
 
-        full_data.append({
-            "filename": filename,
-            "model": cfg.short_name,
-            "model_id": cfg.model_id,
-            **report_dict,
-        })
-
-    # Ensemble majority vote.
-    flags = [bool(row.get(f"{cfg.short_name}_is_frustrating", False))
-             for cfg in MODELS_REGISTRY]
-    num_flagged = sum(flags)
-    row["ensemble_is_frustrating"] = num_flagged >= (len(MODELS_REGISTRY) / 2 + 0.5)
-    row["ensemble_num_models_flagged"] = num_flagged
-
-    row["duration_s"] = duration_s
-    row["total_windows"] = total_windows
-    row["processing_time_s"] = round(time.time() - t0, 2)
-    row["status"] = "Success"
-
-    return row, full_data
+    return row, {"filename": filename, **report_dict}
 
 
-def _process_one(audio_path: Path) -> tuple[dict, list[dict]]:
+def _process_one(audio_path: Path) -> tuple[dict, dict | None]:
     """Wrapper that catches exceptions and returns a failure row."""
     try:
-        return _run_all_models(audio_path)
+        return _run_pipeline(audio_path)
     except Exception as exc:
         logger.error("Failed %s: %s", audio_path.name, exc)
-        row: dict = {col: "" for col in _all_columns()}
+        row: dict = {col: "" for col in EXCEL_COLUMNS}
         row.update({
             "filename": audio_path.name,
             "call_id":  audio_path.stem,
             "status":   f"Failed: {str(exc)[:140]}",
         })
-        return row, []
+        return row, None
 
 
 # ── Folder walker ─────────────────────────────────────────────────────────────
@@ -233,8 +190,7 @@ def batch_process(
 
     logger.info("Found %d audio files in %s", len(files), input_dir)
 
-    # Pre-load all models before spawning threads.
-    logger.info("Pre-loading %d models…", len(MODELS_REGISTRY))
+    logger.info("Pre-loading model…")
     preload_all_models()
 
     rows: list[dict] = []
@@ -246,15 +202,16 @@ def batch_process(
             for fut in tqdm(as_completed(futures), total=len(futures), desc="Analyzing"):
                 row, full = fut.result()
                 rows.append(row)
-                all_full.extend(full)
+                if full:
+                    all_full.append(full)
     else:
         for f in tqdm(files, desc="Analyzing"):
             row, full = _process_one(f)
             rows.append(row)
-            all_full.extend(full)
+            if full:
+                all_full.append(full)
 
-    columns = _all_columns()
-    df = pd.DataFrame(rows, columns=columns)
+    df = pd.DataFrame(rows, columns=EXCEL_COLUMNS)
     df = df.sort_values("filename").reset_index(drop=True)
 
     excel_path = output_dir / excel_filename
@@ -315,23 +272,17 @@ def _col_letter(idx: int) -> str:
 def _print_summary(df: pd.DataFrame, excel_path: Path, json_path: Path) -> None:
     total = len(df)
     ok = df["status"] == "Success"
+    n_frustrating = int(df.loc[ok, "is_frustrating"].sum())
+    n_ok = int(ok.sum())
+    avg_t = df.loc[ok, "processing_time_s"].mean() if n_ok else 0.0
+
     print("\n" + "=" * 64)
     print("BATCH PROCESSING COMPLETE")
     print("=" * 64)
     print(f"  Files processed  : {total}")
-    print(f"  Successful       : {int(ok.sum())}")
-
-    for cfg in MODELS_REGISTRY:
-        col = f"{cfg.short_name}_is_frustrating"
-        if col in df.columns:
-            n = int(df.loc[ok, col].sum())
-            print(f"  [{cfg.short_name:>10}] frustrating : {n}/{int(ok.sum())} "
-                  f"({n/max(int(ok.sum()),1)*100:.1f}%)")
-
-    ens = int(df.loc[ok, "ensemble_is_frustrating"].sum())
-    print(f"  [  ensemble] frustrating : {ens}/{int(ok.sum())} "
-          f"({ens/max(int(ok.sum()),1)*100:.1f}%)")
-    avg_t = df.loc[ok, "processing_time_s"].mean()
+    print(f"  Successful       : {n_ok}")
+    print(f"  Frustrating calls: {n_frustrating}/{n_ok} "
+          f"({n_frustrating / max(n_ok, 1) * 100:.1f}%)")
     print(f"  Avg time / file  : {avg_t:.2f}s")
     print(f"  Excel saved      : {excel_path}")
     print(f"  JSON saved       : {json_path}")
@@ -342,7 +293,7 @@ def _print_summary(df: pd.DataFrame, excel_path: Path, json_path: Path) -> None:
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Batch-analyze call audio with 3 independent emotion models."
+        description="Batch-analyze a folder of call audio and write results to Excel."
     )
     p.add_argument("--input-dir",  required=True, help="Folder containing audio files")
     p.add_argument("--output-dir", default="results", help="Output folder (created if absent)")
