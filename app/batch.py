@@ -3,10 +3,13 @@ Batch-process a folder of call recordings and write:
   - Excel summary (one row per file)
   - full_results.json (per-window timelines)
   - PNG timeline chart per call (score line + emotion strip)
+  - dashboard.html (interactive Plotly charts; click angry points to play audio)
+  - segments/<call_id>/window_<t>.wav  (angry/frustrated clips for the player)
+  - InfluxDB v2 write (optional, set ENABLE_INFLUX=1)
 
 Usage:
     python batch.py --input-dir /path/to/audio
-    python batch.py --input-dir ./calls --output-dir results \
+    python batch.py --input-dir ./calls --output-dir results \\
                     --excel results.xlsx --recursive --workers 4
 """
 
@@ -21,12 +24,16 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
 from audio_loader import load_audio
+from db import write_call_to_influx
+from dashboard import generate_dashboard
 from emotion_model import MODELS_REGISTRY, ModelConfig, get_classifier, preload_all_models
 from post_processing import build_report
+from segment_extractor import save_flagged_segments
 from segmenter import segment_audio
 from visualizer import plot_call
 
@@ -113,8 +120,9 @@ def _count_angry_segments(timeline: list[dict]) -> int:
 def _run_pipeline(
     audio_path: Path,
     chart_dirs: tuple[Path, Path],   # (flagged_dir, not_flagged_dir)
+    output_dir: Path,
 ) -> tuple[dict, dict]:
-    """Load, segment, classify, build report, and save timeline chart."""
+    """Load, segment, classify, build report, save chart + audio segments."""
     filename = audio_path.name
     call_id = audio_path.stem
     t0 = time.time()
@@ -135,6 +143,18 @@ def _run_pipeline(
     except Exception as exc:
         logger.warning("Chart generation failed for %s: %s", filename, exc)
 
+    # Save flagged audio segments for the interactive dashboard player.
+    enriched_timeline = save_flagged_segments(
+        audio, sr, report_dict["timeline"], call_id, output_dir
+    )
+    report_dict["timeline"] = enriched_timeline
+
+    # Optional InfluxDB write.
+    try:
+        write_call_to_influx(call_id, report_dict)
+    except Exception as exc:
+        logger.warning("InfluxDB write skipped for %s: %s", filename, exc)
+
     metrics = _extract_metrics(report_dict)
     duration_s = metrics.pop("_duration_s", 0.0)
     total_windows = metrics.pop("_total_windows", len(segments))
@@ -149,16 +169,24 @@ def _run_pipeline(
         "status": "Success",
     }
 
-    return row, {"filename": filename, **report_dict}
+    full_result = {
+        "call_id": call_id,
+        "filename": filename,
+        "report": report_dict,
+        "timeline": enriched_timeline,
+    }
+
+    return row, full_result
 
 
 def _process_one(
     audio_path: Path,
     chart_dirs: tuple[Path, Path],
+    output_dir: Path,
 ) -> tuple[dict, dict | None]:
     """Wrapper that catches exceptions and returns a failure row."""
     try:
-        return _run_pipeline(audio_path, chart_dirs)
+        return _run_pipeline(audio_path, chart_dirs, output_dir)
     except Exception as exc:
         logger.error("Failed %s: %s", audio_path.name, exc)
         row: dict = {col: "" for col in EXCEL_COLUMNS}
@@ -192,7 +220,7 @@ def batch_process(
     workers: int = 1,
     recursive: bool = False,
 ) -> pd.DataFrame:
-    """Walk `input_dir`, analyze each file, write Excel + JSON + per-call PNGs."""
+    """Walk `input_dir`, analyze each file, write Excel + JSON + per-call PNGs + dashboard."""
     input_dir = Path(input_dir)
     output_dir = Path(output_dir)
     charts_flagged     = output_dir / "charts" / "flagged"
@@ -206,9 +234,6 @@ def batch_process(
         raise ValueError(f"No audio files found in {input_dir}")
 
     logger.info("Found %d audio files in %s", len(files), input_dir)
-    logger.info("Flagged charts   → %s", charts_flagged)
-    logger.info("OK charts        → %s", charts_not_flagged)
-
     logger.info("Pre-loading model…")
     preload_all_models()
 
@@ -219,7 +244,10 @@ def batch_process(
 
     if workers > 1:
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {pool.submit(_process_one, f, chart_dirs): f for f in files}
+            futures = {
+                pool.submit(_process_one, f, chart_dirs, output_dir): f
+                for f in files
+            }
             for fut in tqdm(as_completed(futures), total=len(futures), desc="Analyzing"):
                 row, full = fut.result()
                 rows.append(row)
@@ -227,7 +255,7 @@ def batch_process(
                     all_full.append(full)
     else:
         for f in tqdm(files, desc="Analyzing"):
-            row, full = _process_one(f, chart_dirs)
+            row, full = _process_one(f, chart_dirs, output_dir)
             rows.append(row)
             if full:
                 all_full.append(full)
@@ -239,10 +267,14 @@ def batch_process(
     _write_excel(df, excel_path)
 
     json_path = output_dir / "full_results.json"
-    with json_path.open("w") as f:
-        json.dump(all_full, f, indent=2)
+    with json_path.open("w") as fh:
+        json.dump(all_full, fh, indent=2)
 
-    _print_summary(df, excel_path, json_path, charts_flagged, charts_not_flagged)
+    # Generate interactive HTML dashboard.
+    dashboard_path = generate_dashboard(all_full, output_dir)
+
+    _print_summary(df, excel_path, json_path, charts_flagged, charts_not_flagged,
+                   dashboard_path)
     return df
 
 
@@ -253,7 +285,6 @@ def _write_excel(df: pd.DataFrame, path: Path) -> None:
         df.to_excel(writer, sheet_name="Summary", index=False)
         ws = writer.sheets["Summary"]
 
-        # Auto-size + basic header formatting.
         from openpyxl.styles import Font, PatternFill
         header_fill = PatternFill("solid", fgColor="1F4E79")
         header_font = Font(color="FFFFFF", bold=True)
@@ -269,14 +300,12 @@ def _write_excel(df: pd.DataFrame, path: Path) -> None:
             )
             ws.column_dimensions[_col_letter(idx)].width = min(max_len + 2, 52)
 
-        # Shade every other data row for readability.
         alt_fill = PatternFill("solid", fgColor="D9E1F2")
         for row_idx in range(2, len(df) + 2):
             if row_idx % 2 == 0:
                 for col_idx in range(1, len(df.columns) + 1):
                     ws.cell(row=row_idx, column=col_idx).fill = alt_fill
 
-        # Freeze the header row.
         ws.freeze_panes = "A2"
 
 
@@ -296,6 +325,7 @@ def _print_summary(
     json_path: Path,
     charts_flagged: Path,
     charts_not_flagged: Path,
+    dashboard_path: Path,
 ) -> None:
     total = len(df)
     ok = df["status"] == "Success"
@@ -313,6 +343,7 @@ def _print_summary(
     print(f"  Avg time / file  : {avg_t:.2f}s")
     print(f"  Excel saved      : {excel_path}")
     print(f"  JSON saved       : {json_path}")
+    print(f"  Dashboard        : {dashboard_path}")
     print(f"  Charts (flagged) : {charts_flagged}/")
     print(f"  Charts (ok)      : {charts_not_flagged}/")
     print("=" * 64)
