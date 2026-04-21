@@ -234,6 +234,20 @@ def batch_process(
         raise ValueError(f"No audio files found in {input_dir}")
 
     logger.info("Found %d audio files in %s", len(files), input_dir)
+
+    import torch
+    on_gpu = torch.cuda.is_available() or (
+        hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
+    )
+    if on_gpu and workers > 1:
+        logger.warning(
+            "GPU detected but workers=%d > 1. Multiple threads sharing one GPU "
+            "can cause CUDA errors. Forcing workers=1. "
+            "GPU throughput is maximised via EMOTION_BATCH_SIZE instead.",
+            workers,
+        )
+        workers = 1
+
     logger.info("Pre-loading model…")
     preload_all_models()
 

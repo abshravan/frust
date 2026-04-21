@@ -1,0 +1,19 @@
+# GPU requirements — CUDA 12.4
+#
+# Install order matters: install GPU torch first, then the rest.
+#
+#   pip install torch>=2.5.0 --index-url https://download.pytorch.org/whl/cu124
+#   pip install -r requirements.txt
+#
+# Other CUDA versions:
+#   CUDA 11.8  →  https://download.pytorch.org/whl/cu118
+#   CUDA 12.1  →  https://download.pytorch.org/whl/cu121
+#   CUDA 12.4  →  https://download.pytorch.org/whl/cu124
+#
+# AMD ROCm 6.2:
+#   pip install torch>=2.5.0 --index-url https://download.pytorch.org/whl/rocm6.2
+#   pip install -r requirements.txt
+#
+# Apple Silicon MPS — no special torch build needed, just:
+#   pip install -r requirements.txt
+#   Then set EMOTION_DEVICE=mps in your .env
