@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Optional
 
 import numpy as np
 import torch
@@ -81,7 +80,7 @@ class EmotionClassifier:
     One instance per model; use `get_classifier()` for the singleton cache.
     """
 
-    def __init__(self, config: ModelConfig, device: Optional[int] = None):
+    def __init__(self, config: ModelConfig, device: int | None = None):
         self.config = config
         if device is None:
             device = 0 if torch.cuda.is_available() else -1

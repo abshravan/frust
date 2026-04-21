@@ -13,6 +13,7 @@ Environment variables:
 import logging
 import os
 import tempfile
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated
 
@@ -39,6 +40,16 @@ ENABLE_WHISPER = os.getenv("ENABLE_WHISPER", "0") == "1"
 ALLOWED_EXTENSIONS = {".wav", ".mp3", ".flac", ".ogg", ".m4a"}
 MAX_UPLOAD_BYTES = 200 * 1024 * 1024  # 200 MB
 
+
+# ── Lifespan (replaces deprecated on_event) ───────────────────────────────────
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("Pre-loading emotion model: %s", MODEL_ID)
+    get_classifier(MODEL_ID)
+    logger.info("Model ready.")
+    yield
+
+
 # ── App ───────────────────────────────────────────────────────────────────────
 app = FastAPI(
     title="Patient Emotion Analyzer",
@@ -47,15 +58,8 @@ app = FastAPI(
         "to evaluate voice-bot call quality."
     ),
     version="1.0.0",
+    lifespan=lifespan,
 )
-
-
-@app.on_event("startup")
-async def _startup() -> None:
-    """Pre-load the model so the first request isn't slow."""
-    logger.info("Pre-loading emotion model: %s", MODEL_ID)
-    get_classifier(MODEL_ID)
-    logger.info("Model ready.")
 
 
 @app.get("/health", tags=["ops"])
