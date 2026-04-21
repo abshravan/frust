@@ -61,9 +61,11 @@ def _render_html(calls: list[dict]) -> str:
     n_escalated  = sum(1 for c in calls if c.get("report", {}).get("escalation_detected"))
     pct_flagged  = round(n_flagged / max(total, 1) * 100, 1)
 
-    cards_html   = _summary_cards(total, n_flagged, n_escalated, pct_flagged)
-    charts_html  = _call_panels(calls)
-    calls_json   = json.dumps(calls, ensure_ascii=False)
+    cards_html          = _summary_cards(total, n_flagged, n_escalated, pct_flagged)
+    charts_html         = _call_panels(calls)
+    calls_json          = json.dumps(calls, ensure_ascii=False)
+    emotion_colors_json = json.dumps(_EMOTION_COLORS)
+    default_color       = _DEFAULT_COLOR
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -288,13 +290,7 @@ document.getElementById('player-close').addEventListener('click', () => {{
 }});
 </script>
 </body>
-</html>""".format(
-        cards_html=cards_html,
-        charts_html=charts_html,
-        calls_json=calls_json,
-        emotion_colors_json=json.dumps(_EMOTION_COLORS),
-        default_color=_DEFAULT_COLOR,
-    )
+</html>"""
 
 
 # ── Helper: summary cards ─────────────────────────────────────────────────────
