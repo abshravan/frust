@@ -1,14 +1,13 @@
 """
-Batch-process a folder of call recordings across three independent models
-and write a consolidated Excel report + JSON dump.
+Batch-process a folder of call recordings and write:
+  - Excel summary (one row per file)
+  - full_results.json (per-window timelines)
+  - PNG timeline chart per call (score line + emotion strip)
 
 Usage:
     python batch.py --input-dir /path/to/audio
     python batch.py --input-dir ./calls --output-dir results \
                     --excel results.xlsx --recursive --workers 4
-
-Each audio file is run through all three registered models independently.
-The Excel sheet contains per-model columns plus a majority-vote ensemble.
 """
 
 from __future__ import annotations
@@ -29,6 +28,7 @@ from audio_loader import load_audio
 from emotion_model import MODELS_REGISTRY, ModelConfig, get_classifier, preload_all_models
 from post_processing import build_report
 from segmenter import segment_audio
+from visualizer import plot_call
 
 logger = logging.getLogger(__name__)
 
@@ -110,8 +110,8 @@ def _count_angry_segments(timeline: list[dict]) -> int:
 
 # ── Core: run the model on one file ──────────────────────────────────────────
 
-def _run_pipeline(audio_path: Path) -> tuple[dict, dict]:
-    """Load, segment, classify, and build the report for a single file."""
+def _run_pipeline(audio_path: Path, charts_dir: Path) -> tuple[dict, dict]:
+    """Load, segment, classify, build report, and save timeline chart."""
     filename = audio_path.name
     call_id = audio_path.stem
     t0 = time.time()
@@ -124,6 +124,12 @@ def _run_pipeline(audio_path: Path) -> tuple[dict, dict]:
     predictions = classifier.predict_all(segments)
     report = build_report(predictions)
     report_dict = report.to_dict()
+
+    # Generate the per-call timeline chart.
+    try:
+        plot_call(report_dict, call_id=call_id, output_path=charts_dir)
+    except Exception as exc:
+        logger.warning("Chart generation failed for %s: %s", filename, exc)
 
     metrics = _extract_metrics(report_dict)
     duration_s = metrics.pop("_duration_s", 0.0)
@@ -142,10 +148,10 @@ def _run_pipeline(audio_path: Path) -> tuple[dict, dict]:
     return row, {"filename": filename, **report_dict}
 
 
-def _process_one(audio_path: Path) -> tuple[dict, dict | None]:
+def _process_one(audio_path: Path, charts_dir: Path) -> tuple[dict, dict | None]:
     """Wrapper that catches exceptions and returns a failure row."""
     try:
-        return _run_pipeline(audio_path)
+        return _run_pipeline(audio_path, charts_dir)
     except Exception as exc:
         logger.error("Failed %s: %s", audio_path.name, exc)
         row: dict = {col: "" for col in EXCEL_COLUMNS}
@@ -179,16 +185,19 @@ def batch_process(
     workers: int = 1,
     recursive: bool = False,
 ) -> pd.DataFrame:
-    """Walk `input_dir`, run all three models on each file, write Excel + JSON."""
+    """Walk `input_dir`, analyze each file, write Excel + JSON + per-call PNGs."""
     input_dir = Path(input_dir)
     output_dir = Path(output_dir)
+    charts_dir = output_dir / "charts"
     output_dir.mkdir(parents=True, exist_ok=True)
+    charts_dir.mkdir(parents=True, exist_ok=True)
 
     files = _find_audio_files(input_dir, recursive=recursive)
     if not files:
         raise ValueError(f"No audio files found in {input_dir}")
 
     logger.info("Found %d audio files in %s", len(files), input_dir)
+    logger.info("Charts will be saved to %s", charts_dir)
 
     logger.info("Pre-loading model…")
     preload_all_models()
@@ -198,7 +207,7 @@ def batch_process(
 
     if workers > 1:
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {pool.submit(_process_one, f): f for f in files}
+            futures = {pool.submit(_process_one, f, charts_dir): f for f in files}
             for fut in tqdm(as_completed(futures), total=len(futures), desc="Analyzing"):
                 row, full = fut.result()
                 rows.append(row)
@@ -206,7 +215,7 @@ def batch_process(
                     all_full.append(full)
     else:
         for f in tqdm(files, desc="Analyzing"):
-            row, full = _process_one(f)
+            row, full = _process_one(f, charts_dir)
             rows.append(row)
             if full:
                 all_full.append(full)
@@ -221,7 +230,7 @@ def batch_process(
     with json_path.open("w") as f:
         json.dump(all_full, f, indent=2)
 
-    _print_summary(df, excel_path, json_path)
+    _print_summary(df, excel_path, json_path, charts_dir)
     return df
 
 
@@ -269,7 +278,9 @@ def _col_letter(idx: int) -> str:
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 
-def _print_summary(df: pd.DataFrame, excel_path: Path, json_path: Path) -> None:
+def _print_summary(
+    df: pd.DataFrame, excel_path: Path, json_path: Path, charts_dir: Path
+) -> None:
     total = len(df)
     ok = df["status"] == "Success"
     n_frustrating = int(df.loc[ok, "is_frustrating"].sum())
@@ -286,6 +297,7 @@ def _print_summary(df: pd.DataFrame, excel_path: Path, json_path: Path) -> None:
     print(f"  Avg time / file  : {avg_t:.2f}s")
     print(f"  Excel saved      : {excel_path}")
     print(f"  JSON saved       : {json_path}")
+    print(f"  Charts saved     : {charts_dir}/<call_id>_timeline.png")
     print("=" * 64)
 
 
