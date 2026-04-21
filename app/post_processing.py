@@ -10,13 +10,13 @@ from emotion_model import SegmentPrediction
 logger = logging.getLogger(__name__)
 
 # ── Thresholds (aligned with validated reference pipeline) ───────────────────
-ANGRY_THRESHOLD = 0.60
-DISGUST_THRESHOLD = 0.60
+ANGRY_THRESHOLD = 0.45
+DISGUST_THRESHOLD = 0.45
 
 # Window counts as "frustrated" when anger sits in the mid band below the
 # angry threshold. Lets us derive a frustrated label from a 6-class model
 # that does not emit "frustrated" directly.
-FRUSTRATED_LOWER = 0.35
+FRUSTRATED_LOWER = 0.25
 FRUSTRATED_UPPER = ANGRY_THRESHOLD  # exclusive upper bound
 
 # ── Flagging criteria ─────────────────────────────────────────────────────────

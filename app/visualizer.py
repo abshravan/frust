@@ -33,7 +33,7 @@ def plot_call(
     report: dict,
     call_id: str,
     output_path: Path,
-    threshold: float = 0.60,
+    threshold: float = 0.45,
 ) -> None:
     """
     Generate a two-panel PNG chart for a single call:

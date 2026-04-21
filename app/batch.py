@@ -110,7 +110,10 @@ def _count_angry_segments(timeline: list[dict]) -> int:
 
 # ── Core: run the model on one file ──────────────────────────────────────────
 
-def _run_pipeline(audio_path: Path, charts_dir: Path) -> tuple[dict, dict]:
+def _run_pipeline(
+    audio_path: Path,
+    chart_dirs: tuple[Path, Path],   # (flagged_dir, not_flagged_dir)
+) -> tuple[dict, dict]:
     """Load, segment, classify, build report, and save timeline chart."""
     filename = audio_path.name
     call_id = audio_path.stem
@@ -125,9 +128,10 @@ def _run_pipeline(audio_path: Path, charts_dir: Path) -> tuple[dict, dict]:
     report = build_report(predictions)
     report_dict = report.to_dict()
 
-    # Generate the per-call timeline chart.
+    # Route chart to flagged/ or not_flagged/ based on the result.
+    dest = chart_dirs[0] if report_dict.get("flagged") else chart_dirs[1]
     try:
-        plot_call(report_dict, call_id=call_id, output_path=charts_dir)
+        plot_call(report_dict, call_id=call_id, output_path=dest)
     except Exception as exc:
         logger.warning("Chart generation failed for %s: %s", filename, exc)
 
@@ -148,10 +152,13 @@ def _run_pipeline(audio_path: Path, charts_dir: Path) -> tuple[dict, dict]:
     return row, {"filename": filename, **report_dict}
 
 
-def _process_one(audio_path: Path, charts_dir: Path) -> tuple[dict, dict | None]:
+def _process_one(
+    audio_path: Path,
+    chart_dirs: tuple[Path, Path],
+) -> tuple[dict, dict | None]:
     """Wrapper that catches exceptions and returns a failure row."""
     try:
-        return _run_pipeline(audio_path, charts_dir)
+        return _run_pipeline(audio_path, chart_dirs)
     except Exception as exc:
         logger.error("Failed %s: %s", audio_path.name, exc)
         row: dict = {col: "" for col in EXCEL_COLUMNS}
@@ -188,16 +195,19 @@ def batch_process(
     """Walk `input_dir`, analyze each file, write Excel + JSON + per-call PNGs."""
     input_dir = Path(input_dir)
     output_dir = Path(output_dir)
-    charts_dir = output_dir / "charts"
+    charts_flagged     = output_dir / "charts" / "flagged"
+    charts_not_flagged = output_dir / "charts" / "not_flagged"
     output_dir.mkdir(parents=True, exist_ok=True)
-    charts_dir.mkdir(parents=True, exist_ok=True)
+    charts_flagged.mkdir(parents=True, exist_ok=True)
+    charts_not_flagged.mkdir(parents=True, exist_ok=True)
 
     files = _find_audio_files(input_dir, recursive=recursive)
     if not files:
         raise ValueError(f"No audio files found in {input_dir}")
 
     logger.info("Found %d audio files in %s", len(files), input_dir)
-    logger.info("Charts will be saved to %s", charts_dir)
+    logger.info("Flagged charts   → %s", charts_flagged)
+    logger.info("OK charts        → %s", charts_not_flagged)
 
     logger.info("Pre-loading model…")
     preload_all_models()
@@ -205,9 +215,11 @@ def batch_process(
     rows: list[dict] = []
     all_full: list[dict] = []
 
+    chart_dirs = (charts_flagged, charts_not_flagged)
+
     if workers > 1:
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {pool.submit(_process_one, f, charts_dir): f for f in files}
+            futures = {pool.submit(_process_one, f, chart_dirs): f for f in files}
             for fut in tqdm(as_completed(futures), total=len(futures), desc="Analyzing"):
                 row, full = fut.result()
                 rows.append(row)
@@ -215,7 +227,7 @@ def batch_process(
                     all_full.append(full)
     else:
         for f in tqdm(files, desc="Analyzing"):
-            row, full = _process_one(f, charts_dir)
+            row, full = _process_one(f, chart_dirs)
             rows.append(row)
             if full:
                 all_full.append(full)
@@ -230,7 +242,7 @@ def batch_process(
     with json_path.open("w") as f:
         json.dump(all_full, f, indent=2)
 
-    _print_summary(df, excel_path, json_path, charts_dir)
+    _print_summary(df, excel_path, json_path, charts_flagged, charts_not_flagged)
     return df
 
 
@@ -279,7 +291,11 @@ def _col_letter(idx: int) -> str:
 # ── Summary ───────────────────────────────────────────────────────────────────
 
 def _print_summary(
-    df: pd.DataFrame, excel_path: Path, json_path: Path, charts_dir: Path
+    df: pd.DataFrame,
+    excel_path: Path,
+    json_path: Path,
+    charts_flagged: Path,
+    charts_not_flagged: Path,
 ) -> None:
     total = len(df)
     ok = df["status"] == "Success"
@@ -297,7 +313,8 @@ def _print_summary(
     print(f"  Avg time / file  : {avg_t:.2f}s")
     print(f"  Excel saved      : {excel_path}")
     print(f"  JSON saved       : {json_path}")
-    print(f"  Charts saved     : {charts_dir}/<call_id>_timeline.png")
+    print(f"  Charts (flagged) : {charts_flagged}/")
+    print(f"  Charts (ok)      : {charts_not_flagged}/")
     print("=" * 64)
 
 
